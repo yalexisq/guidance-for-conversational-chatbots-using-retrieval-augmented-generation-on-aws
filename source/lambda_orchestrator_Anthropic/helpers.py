@@ -6,10 +6,10 @@ import config
 import re
 import os
 import boto3
+import uuid
+from datetime import datetime, timezone
 
-from KendraAgent import KendraAgent
 from memory import chatMemory
-from tools import KendraChatBotTools
 from langchain import SagemakerEndpoint
 from langchain.llms.sagemaker_endpoint import ContentHandlerBase
 from typing import Any, Optional ,Dict
@@ -115,6 +115,90 @@ def clear_history(event):
     chatMemory(sessionId).clear_DynamoDBChatMessageHistory()
     return "conversation history cleared"
 
+def get_slot_value(intent_request, slot_name):
+    slots = intent_request.get('sessionState', {}).get('intent', {}).get('slots', {}) or {}
+    slot = slots.get(slot_name) or {}
+    if not slot:
+        return None
+    if isinstance(slot, dict):
+        value = slot.get('value', {})
+        if isinstance(value, dict):
+            return value.get('interpretedValue') or value.get('originalValue')
+    return None
+
+def get_document_table():
+    dynamodb = boto3.resource('dynamodb')
+    return dynamodb.Table(config.config.DOCUMENTS_TABLE_NAME)
+
+def get_allowed_admins():
+    raw = config.config.ADMIN_USERNAMES
+    return {name.strip().lower() for name in raw.split(',') if name.strip()}
+
+def validate_admin(username, passcode):
+    if not username:
+        return False, "Please provide your admin username."
+    allowed = get_allowed_admins()
+    if allowed and username.lower() not in allowed:
+        return False, "You are not authorized to access admin features."
+    if config.config.ADMIN_PASSCODE and passcode != config.config.ADMIN_PASSCODE:
+        return False, "Invalid admin passcode."
+    return True, "Admin access granted."
+
+def store_document(title, category, content, uploaded_by):
+    doc_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    table = get_document_table()
+    table.put_item(
+        Item={
+            "doc_id": doc_id,
+            "title": title,
+            "category": category,
+            "content": content,
+            "uploaded_by": uploaded_by,
+            "created_at": now,
+        }
+    )
+    return doc_id
+
+def normalize_terms(text):
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
+    return [term for term in cleaned.split() if len(term) > 2]
+
+def retrieve_documents(query, limit=3):
+    table = get_document_table()
+    items = []
+    response = table.scan(
+        ProjectionExpression="doc_id, title, category, content, created_at"
+    )
+    items.extend(response.get("Items", []))
+    while "LastEvaluatedKey" in response:
+        response = table.scan(
+            ProjectionExpression="doc_id, title, category, content, created_at",
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+        )
+        items.extend(response.get("Items", []))
+
+    terms = normalize_terms(query)
+    scored = []
+    for item in items:
+        content = f"{item.get('title', '')} {item.get('content', '')}".lower()
+        score = sum(1 for term in terms if term in content)
+        scored.append((score, item))
+
+    scored.sort(key=lambda entry: (entry[0], entry[1].get("created_at", "")), reverse=True)
+    filtered = [item for score, item in scored if score > 0]
+    if not filtered:
+        filtered = [item for _, item in scored]
+    return filtered[:limit]
+
+def format_history(memory):
+    history = memory.load_memory_variables({}).get("history", [])
+    lines = []
+    for message in history:
+        role = "User" if message.type == "human" else "Assistant"
+        lines.append(f"{role}: {message.content}")
+    return "\n".join(lines)
+
 #AI handler
 def AI_handler(event):
     #print('printing Event : ',event)
@@ -127,18 +211,37 @@ def AI_handler(event):
         temperature=0
     )
     
-    #llmm =SagemakerEndpoint(
-    #    endpoint_name="j2-jumbo-instruct",
-    #    region_name="us-east-1", 
-    #    model_kwargs={"temperature":0,"maxTokens":1000 ,"numResults": 2},
-    #    content_handler=content_handler
-    #)
-    
-    tools = KendraChatBotTools().tools
     memory = chatMemory(sessionId).memory
+    documents = retrieve_documents(user_message, limit=3)
+    history_text = format_history(memory)
+    if documents:
+        docs_text = "\n\n".join(
+            [
+                f"Document {index + 1} ({doc.get('category', 'General')}): "
+                f"{doc.get('title', 'Untitled')}\n{doc.get('content', '')}"
+                for index, doc in enumerate(documents)
+            ]
+        )
+    else:
+        docs_text = "No documents available."
 
-    kendra_agent = KendraAgent(llm, memory, tools)
-    message = kendra_agent.run(input=user_message)
-    return url_parser(message)
-
+    prompt = (
+        "You are an internal assistant that answers questions using only the provided "
+        "SOP and HR documents. If the answer is not contained in the documents, say you "
+        "do not have that information. Provide a concise answer and end with a line in "
+        "this format: Sources: <title> (<doc_id>), <title> (<doc_id>).\n\n"
+        f"Conversation history:\n{history_text}\n\n"
+        f"Documents:\n{docs_text}\n\n"
+        f"Question: {user_message}\nAnswer:"
+    )
+    response = llm.predict(prompt)
+    if documents:
+        sources = ", ".join(
+            [
+                f"{doc.get('title', 'Untitled')} ({doc.get('doc_id')})"
+                for doc in documents
+            ]
+        )
+        response = f"{response}\nSources: {sources}"
+    return url_parser(response)
 
