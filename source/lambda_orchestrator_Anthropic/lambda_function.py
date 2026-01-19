@@ -70,12 +70,46 @@ def clear_history_intent_handler(intent_request, session_attributes):
     response_string = helpers.clear_history(intent_request)
     return helpers.close(intent_request,session_attributes, 'Fulfilled', {'contentType': 'PlainText','content': response_string})   
 
+def admin_login_intent_handler(intent_request, session_attributes):
+    username = helpers.get_slot_value(intent_request, "username")
+    passcode = helpers.get_slot_value(intent_request, "passcode")
+    is_valid, message = helpers.validate_admin(username, passcode)
+    if is_valid:
+        session_attributes["isAdmin"] = "true"
+        session_attributes["adminUser"] = username
+    else:
+        session_attributes["isAdmin"] = "false"
+    return helpers.close(intent_request, session_attributes, 'Fulfilled', {'contentType': 'PlainText','content': message})
+
+def admin_add_document_intent_handler(intent_request, session_attributes):
+    if session_attributes.get("isAdmin") != "true":
+        response_string = "Admin access required. Please log in as an admin to add documents."
+        return helpers.close(intent_request, session_attributes, 'Fulfilled', {'contentType': 'PlainText','content': response_string})
+
+    title = helpers.get_slot_value(intent_request, "title")
+    category = helpers.get_slot_value(intent_request, "category") or "General"
+    content = helpers.get_slot_value(intent_request, "content")
+    if not title or not content:
+        response_string = "Please provide both a document title and content."
+        return helpers.close(intent_request, session_attributes, 'Fulfilled', {'contentType': 'PlainText','content': response_string})
+
+    doc_id = helpers.store_document(
+        title=title,
+        category=category,
+        content=content,
+        uploaded_by=session_attributes.get("adminUser", "unknown"),
+    )
+    response_string = f"Document added successfully with ID {doc_id}."
+    return helpers.close(intent_request, session_attributes, 'Fulfilled', {'contentType': 'PlainText','content': response_string})
+
 # list of intent handler functions for the dispatch proccess
 HANDLERS = {
     'chatbot_hello':            {'handler': hello_intent_handler},
     'help_desk_goodbye':        {'handler': goodbye_intent_handler},
     'standard_question_intent': {'handler': standard_question_intent_handler},
-    'clearhistoryIntent':       {'handler': clear_history_intent_handler}
+    'clearhistoryIntent':       {'handler': clear_history_intent_handler},
+    'admin_login':              {'handler': admin_login_intent_handler},
+    'admin_add_document':       {'handler': admin_add_document_intent_handler}
     #'FallbackIntent':         {'handler': fallback_intent_handler},
 }
 
